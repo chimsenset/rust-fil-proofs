@@ -7,4 +7,5 @@ heaptrack*
 .bencher
 *.profile
 *.heap
+.idea
 rust-fil-proofs.config.toml

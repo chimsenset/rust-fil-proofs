@@ -651,3 +651,7 @@ where
     ensure_parent(file_path)?;
     f(&mut open_file(file_path)?)
 }
+
+pub fn market_cache_dir_name() -> String {
+    SETTINGS.multicore_sdr_maker_cache.clone()
+}

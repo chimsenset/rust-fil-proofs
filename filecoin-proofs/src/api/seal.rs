@@ -19,7 +19,7 @@ use storage_proofs_core::{
     measurements::{measure_op, Operation},
     merkle::{create_base_merkle_tree, BinaryMerkleTree, MerkleTreeTrait},
     multi_proof::MultiProof,
-    parameter_cache::SRS_MAX_PROOFS_TO_AGGREGATE,
+    parameter_cache::{SRS_MAX_PROOFS_TO_AGGREGATE,market_cache_dir_name},
     proof::ProofScheme,
     sector::SectorId,
     util::default_rows_to_discard,
@@ -48,6 +48,78 @@ use crate::{
         SealPreCommitOutput, SealPreCommitPhase1Output, SectorSize, Ticket, BINARY_ARITY,
     },
 };
+
+fn is_market_exists() -> bool {
+    let tree_exist = Path::new(&get_market_tree_path()).exists();
+    let sealed_exist = Path::new(&get_market_sealed_path()).exists();
+    tree_exist && sealed_exist
+}
+
+fn get_market_tree_path() -> String {
+    format!("{}/{}", market_cache_dir_name(), "tree")
+}
+
+fn get_market_sealed_path() -> String {
+    format!("{}/{}", market_cache_dir_name(), "sealed")
+}
+
+fn get_comm_d_path(cache_path: String) -> String {
+    format!("{}/{}", cache_path, "sc-02-data-tree-d.dat")
+}
+
+fn get_commitment() -> Commitment {
+    let mut commitment = [0; 32];
+    let  comm_path = format!("{}/{}", market_cache_dir_name(), "commitment");
+    let data = fs::read(comm_path).unwrap();
+    commitment.copy_from_slice(data.as_slice());
+    commitment
+}
+
+fn set_commitment(commitment: Commitment) {
+    let  comm_path = format!("{}/{}", market_cache_dir_name(), "commitment");
+    let mut file = fs::File::create(comm_path).expect("create failed");
+    file.write_all(&commitment).expect("write err");
+}
+
+fn get_discard() -> usize {
+    let p = format!("{}/{}", market_cache_dir_name(), "discard");
+    let discard = fs::read_to_string(p).expect("open file err");
+    discard.parse().unwrap()
+}
+
+fn set_discard(discard: usize) {
+    let p = format!("{}/{}", market_cache_dir_name(), "discard");
+    let mut file = fs::File::create(p).expect("create failed");
+    file.write_all(discard.to_string().as_bytes()).expect("write err");
+}
+
+fn get_config_size() -> usize {
+    let p = format!("{}/{}", market_cache_dir_name(), "sz");
+    let discard = fs::read_to_string(p).expect("open file err");
+    discard.parse().unwrap()
+}
+
+fn set_config_size(sz: usize) {
+    let p = format!("{}/{}", market_cache_dir_name(), "sz");
+    let mut file = fs::File::create(p).expect("create failed");
+    file.write_all(sz.to_string().as_bytes()).expect("write err");
+}
+
+fn from_market_tree(cache_path: String) {
+    fs::soft_link(get_market_tree_path(), get_comm_d_path(cache_path)).expect("from market error");
+}
+
+fn to_market_tree(cache_path: String) {
+    fs::copy(get_comm_d_path(cache_path), get_market_tree_path()).expect("to market tree error");
+}
+
+fn from_market_sealed(sealed_path: String) {
+    fs::copy(get_market_sealed_path(), sealed_path).expect("from market sealed error");
+}
+
+fn to_market_sealed(sealed_path: String) {
+    fs::copy(sealed_path, get_market_sealed_path()).expect("to market sealed error");
+}
 
 #[allow(clippy::too_many_arguments)]
 pub fn seal_pre_commit_phase1<R, S, T, Tree: 'static + MerkleTreeTrait>(
@@ -81,37 +153,6 @@ where
         "cache_path must be a directory"
     );
 
-    let sector_bytes = usize::from(PaddedBytesAmount::from(porep_config));
-    fs::metadata(&in_path)
-        .with_context(|| format!("could not read in_path={:?})", in_path.as_ref().display()))?;
-
-    fs::metadata(&out_path)
-        .with_context(|| format!("could not read out_path={:?}", out_path.as_ref().display()))?;
-
-    // Copy unsealed data to output location, where it will be sealed in place.
-    fs::copy(&in_path, &out_path).with_context(|| {
-        format!(
-            "could not copy in_path={:?} to out_path={:?}",
-            in_path.as_ref().display(),
-            out_path.as_ref().display()
-        )
-    })?;
-
-    let f_data = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(&out_path)
-        .with_context(|| format!("could not open out_path={:?}", out_path.as_ref().display()))?;
-
-    // Zero-pad the data to the requested size by extending the underlying file if needed.
-    f_data.set_len(sector_bytes as u64)?;
-
-    let data = unsafe {
-        MmapOptions::new()
-            .map_mut(&f_data)
-            .with_context(|| format!("could not mmap out_path={:?}", out_path.as_ref().display()))?
-    };
-
     let compound_setup_params = compound_proof::SetupParams {
         vanilla_params: setup_params(
             PaddedBytesAmount::from(porep_config),
@@ -128,43 +169,95 @@ where
         _,
     >>::setup(&compound_setup_params)?;
 
-    trace!("building merkle tree for the original data");
-    let (config, comm_d) = measure_op(Operation::CommD, || -> Result<_> {
-        let base_tree_size = get_base_tree_size::<DefaultBinaryTree>(porep_config.sector_size)?;
-        let base_tree_leafs = get_base_tree_leafs::<DefaultBinaryTree>(base_tree_size)?;
-        ensure!(
+    if is_market_exists() {
+        from_market_tree(String::from(cache_path.as_ref().to_str().unwrap()));
+        from_market_sealed(String::from(out_path.as_ref().to_str().unwrap()));
+    } else {
+        let sector_bytes = usize::from(PaddedBytesAmount::from(porep_config));
+        fs::metadata(&in_path)
+            .with_context(|| format!("could not read in_path={:?})", in_path.as_ref().display()))?;
+
+        fs::metadata(&out_path)
+            .with_context(|| format!("could not read out_path={:?}", out_path.as_ref().display()))?;
+
+        // Copy unsealed data to output location, where it will be sealed in place.
+        fs::copy(&in_path, &out_path).with_context(|| {
+            format!(
+                "could not copy in_path={:?} to out_path={:?}",
+                in_path.as_ref().display(),
+                out_path.as_ref().display()
+            )
+        })?;
+
+        let f_data = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&out_path)
+            .with_context(|| format!("could not open out_path={:?}", out_path.as_ref().display()))?;
+        // Zero-pad the data to the requested size by extending the underlying file if needed.
+        f_data.set_len(sector_bytes as u64)?;
+
+        let data = unsafe {
+            MmapOptions::new()
+                .map_mut(&f_data)
+                .with_context(|| format!("could not mmap out_path={:?}", out_path.as_ref().display()))?
+        };
+
+        trace!("building merkle tree for the original data");
+        let (config, comm_d) = measure_op(Operation::CommD, || -> Result<_> {
+            let base_tree_size = get_base_tree_size::<DefaultBinaryTree>(porep_config.sector_size)?;
+            let base_tree_leafs = get_base_tree_leafs::<DefaultBinaryTree>(base_tree_size)?;
+            ensure!(
             compound_public_params.vanilla_params.graph.size() == base_tree_leafs,
             "graph size and leaf size don't match"
         );
 
-        trace!(
+            trace!(
             "seal phase 1: sector_size {}, base tree size {}, base tree leafs {}",
             u64::from(porep_config.sector_size),
             base_tree_size,
             base_tree_leafs,
         );
 
-        let mut config = StoreConfig::new(
-            cache_path.as_ref(),
-            CacheKey::CommDTree.to_string(),
-            default_rows_to_discard(base_tree_leafs, BINARY_ARITY),
-        );
+            let mut config = StoreConfig::new(
+                cache_path.as_ref(),
+                CacheKey::CommDTree.to_string(),
+                default_rows_to_discard(base_tree_leafs, BINARY_ARITY),
+            );
 
-        let data_tree = create_base_merkle_tree::<BinaryMerkleTree<DefaultPieceHasher>>(
-            Some(config.clone()),
-            base_tree_leafs,
-            &data,
-        )?;
-        drop(data);
+            let data_tree = create_base_merkle_tree::<BinaryMerkleTree<DefaultPieceHasher>>(
+                Some(config.clone()),
+                base_tree_leafs,
+                &data,
+            )?;
+            drop(data);
 
-        config.size = Some(data_tree.len());
-        let comm_d_root: Fr = data_tree.root().into();
-        let comm_d = commitment_from_fr(comm_d_root);
+            config.size = Some(data_tree.len());
+            let comm_d_root: Fr = data_tree.root().into();
+            let comm_d = commitment_from_fr(comm_d_root);
 
-        drop(data_tree);
+            drop(data_tree);
 
-        Ok((config, comm_d))
-    })?;
+            Ok((config, comm_d))
+        })?;
+
+        if !is_market_exists() {
+            to_market_tree(String::from(cache_path.as_ref().to_str().unwrap()));
+            to_market_sealed(String::from(out_path.as_ref().to_str().unwrap()));
+            set_commitment(comm_d);
+            set_discard(config.rows_to_discard);
+            set_config_size(config.size.unwrap());
+        }
+
+    }
+
+    let mut config = StoreConfig::new(
+        cache_path.as_ref(),
+        CacheKey::CommDTree.to_string(),
+        get_discard(),
+    );
+    config.size = Some(get_config_size());
+    let comm_d = get_commitment();
 
     trace!("verifying pieces");
 
